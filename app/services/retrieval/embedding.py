@@ -1,98 +1,128 @@
+import re
+import threading
 import time
+from collections.abc import Callable
+from typing import TypeVar
+
 import logfire
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
+
 from app.config import settings
 
-BATCH_SIZE= 50
-_GEMINI_DIM = 3072
-_FALLBACK_DIM = 768
+BATCH_SIZE = 50
+GEMINI_MODEL = "models/gemini-embedding-2-preview"
+GEMINI_DIM = 3072
+GEMINI_REQUESTS_PER_MINUTE = 100
+MIN_REQUEST_INTERVAL_SECONDS = 60 / GEMINI_REQUESTS_PER_MINUTE
+MAX_RATE_LIMIT_WAIT_SECONDS = 10 * 60
+RATE_LIMIT_BUFFER_SECONDS = 2
 
-_active_model = None
-_model_type: str | None = None
-
-def _probe_gemini():
-    """Try one embed call to verify Gemini is reachable. Returns model or None."""
-    try:
-        model = GoogleGenerativeAIEmbeddings(
-            model="models/gemini-embedding-2-preview",
-            google_api_key=settings.GEMINI_API_KEY,
-        )
-        model.embed_query("probe")
-        logfire.info("Gemini embeddings ready (gemini-embedding-2-preview, 3072-dim).")
-        return model
-    except Exception as e:
-        logfire.warning(f"Gemini probe failed: {e}. Will use sentence-transformers fallback.")
-        return None
+_active_model: GoogleGenerativeAIEmbeddings | None = None
+_request_lock = threading.Lock()
+_last_request_at = 0.0
+Result = TypeVar("Result")
 
 
-def _load_fallback():
-    from sentence_transformers import SentenceTransformer
-    logfire.info("Loading sentence-transformers fallback (all-mpnet-base-v2, 768-dim).")
-    return SentenceTransformer("all-mpnet-base-v2")
-
-def _init():
-    """Initialise embedding model once per process. Called lazily on first use."""
-    global _active_model, _model_type
+def _init() -> None:
+    """Initialise the sole embedding model used by this RAG collection."""
+    global _active_model
     if _active_model is not None:
         return
 
-    gemini = _probe_gemini()
-    if gemini:
-        _active_model = gemini
-        _model_type = "gemini"
-    else:
-        _active_model = _load_fallback()
-        _model_type = "fallback"
+    try:
+        model = GoogleGenerativeAIEmbeddings(
+            model=GEMINI_MODEL,
+            google_api_key=settings.GEMINI_API_KEY,
+        )
+        _call_with_rate_limit_retry(lambda: model.embed_query("probe"))
+    except Exception as error:
+        logfire.error(f"Gemini embedding probe failed: {error}")
+        raise RuntimeError(
+            "Gemini embeddings are unavailable. This collection requires "
+            f"{GEMINI_MODEL} ({GEMINI_DIM} dimensions), so no fallback model is used."
+        ) from error
 
+    _active_model = model
+    logfire.info(f"Gemini embeddings ready ({GEMINI_MODEL}, {GEMINI_DIM}-dim).")
 
-# ── Public helpers ─────────────────────────────────────────────────────────────
 
 def get_embedding_dim() -> int:
-    """Return the vector dimension for the active model. Call after _init()."""
-    _init()
-    return _GEMINI_DIM if _model_type == "gemini" else _FALLBACK_DIM
+    """Return the fixed vector dimension for the collection embedding model."""
+    return GEMINI_DIM
 
 
-# ── Batch embedding with retry ─────────────────────────────────────────────────
-
-def _embed_batch(batch: list[str]) -> list[list[float]]:
-    if _model_type == "gemini":
-        # Exponential backoff: 1 s → 2 s → 4 s → 8 s (4 attempts total)
-        for attempt in range(4):
-            try:
-                return _active_model.embed_documents(batch)
-            except Exception as e:
-                err = str(e).lower()
-                is_rate_limit = any(x in err for x in ("429", "rate", "quota", "resource_exhausted"))
-                if is_rate_limit and attempt < 3:
-                    wait = 2 ** attempt
-                    logfire.warning(
-                        f"Gemini rate limit hit — retrying in {wait}s "
-                        f"(attempt {attempt + 1}/4)."
-                    )
-                    time.sleep(wait)
-                else:
-                    logfire.error(f"Gemini embedding failed: {e}")
-                    raise
-        raise RuntimeError("Gemini rate limit persisted after 4 attempts.")
-    else:
-        return _active_model.encode(batch, show_progress_bar=False).tolist()
+def get_embedding_model_name() -> str:
+    """Return the model recorded with each indexed point."""
+    return GEMINI_MODEL
 
 
-# ── Public API (same signatures as before) ─────────────────────────────────────
+def _is_rate_limit(error: Exception) -> bool:
+    message = str(error).lower()
+    return any(marker in message for marker in ("429", "rate", "quota", "resource_exhausted"))
+
+
+def _retry_delay_seconds(error: Exception, attempt: int) -> float:
+    """Honor Gemini's RetryInfo delay when present, then add a safety buffer."""
+    message = str(error)
+    match = re.search(r"(?:retrydelay|retry in)[^0-9]*(\d+(?:\.\d+)?)s", message, re.IGNORECASE)
+    if match:
+        return float(match.group(1)) + RATE_LIMIT_BUFFER_SECONDS
+    return min(2**attempt, 60)
+
+
+def _wait_for_request_slot() -> None:
+    """Keep this process below the configured Gemini request rate."""
+    global _last_request_at
+    with _request_lock:
+        wait = MIN_REQUEST_INTERVAL_SECONDS - (time.monotonic() - _last_request_at)
+        if wait > 0:
+            logfire.info(f"Pacing Gemini embedding request for {wait:.2f}s.")
+            time.sleep(wait)
+        _last_request_at = time.monotonic()
+
+
+def _call_with_rate_limit_retry(operation: Callable[[], Result]) -> Result:
+    deadline = time.monotonic() + MAX_RATE_LIMIT_WAIT_SECONDS
+    attempt = 0
+
+    while True:
+        _wait_for_request_slot()
+        try:
+            return operation()
+        except Exception as error:
+            if not _is_rate_limit(error):
+                logfire.error(f"Gemini embedding failed: {error}")
+                raise
+
+            wait = _retry_delay_seconds(error, attempt)
+            if time.monotonic() + wait > deadline:
+                raise RuntimeError(
+                    "Gemini rate limit did not clear within "
+                    f"{MAX_RATE_LIMIT_WAIT_SECONDS} seconds."
+                ) from error
+
+            attempt += 1
+            logfire.warning(
+                f"Gemini rate limit hit; retrying in {wait:.2f}s "
+                f"(attempt {attempt})."
+            )
+            time.sleep(wait)
+
 
 def embed_query(query: str) -> list[float]:
     _init()
-    if _model_type == "gemini":
-        return _active_model.embed_query(query)
-    return _active_model.encode([query])[0].tolist()
+    return _call_with_rate_limit_retry(lambda: _active_model.embed_query(query))
+
+
+def _embed_batch(batch: list[str]) -> list[list[float]]:
+    return _call_with_rate_limit_retry(lambda: _active_model.embed_documents(batch))
 
 
 def embed_texts(texts: list[str]) -> list[list[float]]:
     _init()
     all_embeddings: list[list[float]] = []
-    for i in range(0, len(texts), BATCH_SIZE):
-        batch = texts[i : i + BATCH_SIZE]
-        with logfire.span("Embed batch", model=_model_type, start=i, size=len(batch)):
+    for start in range(0, len(texts), BATCH_SIZE):
+        batch = texts[start : start + BATCH_SIZE]
+        with logfire.span("Embed batch", model=GEMINI_MODEL, start=start, size=len(batch)):
             all_embeddings.extend(_embed_batch(batch))
     return all_embeddings
