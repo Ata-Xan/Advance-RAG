@@ -4,7 +4,7 @@ from app.config import settings
 from langchain_groq import ChatGroq
 
 # Direct Groq call — the LLM Gateway (Portkey routing/fallback/caching) arrives in a later stage
-llm = ChatGroq(api_key=settings.GROQ_API_KEY, model=settings.GROQ_MODEL, temperature=0.1,     reasoning_effort="none",
+llm = ChatGroq(api_key=settings.GROQ_API_KEY, model=settings.GROQ_MODEL, temperature=0.1, reasoning_effort="none",
     reasoning_format="hidden",)
 
 
