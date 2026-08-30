@@ -1,11 +1,9 @@
 import logfire
 from app.agents.state import AgentState
-from app.config import settings
-from langchain_groq import ChatGroq
+from app.llm import create_groq_llm
 
-# Direct Groq call — the LLM Gateway (Portkey routing/fallback/caching) arrives in a later stage
-llm = ChatGroq(api_key=settings.GROQ_API_KEY, model=settings.GROQ_MODEL, temperature=0.1, reasoning_effort="none",
-    reasoning_format="hidden",)
+# Requests are routed to the Groq provider stored in Portkey as @rag1.
+llm = create_groq_llm(temperature=0.1)
 
 
 def generate_node(state: AgentState):
